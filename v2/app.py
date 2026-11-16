@@ -1,9 +1,9 @@
 """
 EUBA v2 - Tableau de bord SOC (Streamlit).
 
-  📡 Flux Kafka : détection en temps réel ; cliquer sur un utilisateur du
+   Flux Kafka : détection en temps réel ; cliquer sur un utilisateur du
                   tableau des alertes affiche son détail et ses flags.
-  ✅ Évaluation : performances du modèle sur le jeu de test avec attaques.
+   Évaluation : performances du modèle sur le jeu de test avec attaques.
 
 Lancement :  streamlit run v2/app.py   (ou run.ps1 à la racine du dépôt)
 """
@@ -143,7 +143,7 @@ def user_detail(live, user):
                     f"{worst['date']}** (risque {int(worst['risk'])})")
         bar = px.bar(flags[::-1], x="Erreur", y="Variable", orientation="h",
                      labels={"Erreur": "(x − x̂)²", "Variable": ""},
-                     color_discrete_sequence=["#e63946"])
+                     color_discrete_sequence=["#1f77b4"])
         bar.update_layout(height=320, margin=dict(t=10, b=10))
         st.plotly_chart(bar, use_container_width=True)
 
@@ -180,8 +180,7 @@ def kafka_live():
               else f"il y a {int(lag)} s")
     if lag > 15:
         st.warning(f"⏸️ Plus aucun message depuis {int(lag)} s : le flux est "
-                   "terminé ou arrêté. Si ce n'est pas la fin, vérifiez que "
-                   "Kafka (Docker) et le producteur tournent toujours.")
+                   "terminé ou arrêté.")
 
     per_day = (live.groupby("date")
                .agg(messages=("user_id", "size"), alertes=("alert", "sum"))
@@ -237,9 +236,7 @@ def kafka_live():
 
 with tab_kafka:
     st.subheader("📡 Détection en temps réel via Kafka")
-    st.caption("Producteur → topic « euba-events » → détecteur "
-               "(autoencodeur) → alertes (topic « euba-alerts ») → ce "
-               "tableau, rafraîchi toutes les 2 secondes.")
+    st.caption(" ")
     kafka_live()
 
 
@@ -287,6 +284,10 @@ with tab_eval:
         cm = pd.DataFrame([[tn, fp], [fn, tp]],
                           index=["Réel : normal", "Réel : attaque"],
                           columns=["Prédit : normal", "Prédit : alerte"])
-        st.plotly_chart(px.imshow(cm, text_auto=True,
-                                  color_continuous_scale="Blues"),
-                        use_container_width=True)
+        labels = [[f"TN = {tn}<br>", f"FP = {fp}<br>"],
+                  [f"FN = {fn}<br>", f"TP = {tp}<br>"]]
+        fig_cm = px.imshow(cm, color_continuous_scale="Blues")
+        fig_cm.update_traces(text=labels, texttemplate="%{text}",
+                             textfont_size=16)
+        st.plotly_chart(fig_cm, use_container_width=True)
+        st.caption(" ")
