@@ -1,5 +1,11 @@
 # EUBA — User Behavior Anomaly Detection
 
+> **Version 2 (branche `v2-kafka-streaming`)** : modèle réentraîné avec
+> découpage temporel, seuil dynamique μ + kσ, attaques simulées et évaluation,
+> tableau de bord à 5 onglets et détection en temps réel via **Kafka**.
+> **Lancement en une commande :** voir [LANCEMENT.md](LANCEMENT.md)
+> (`powershell -ExecutionPolicy Bypass -File run.ps1 -Kafka`).
+
 EUBA is a cybersecurity research prototype for detecting unusual user
 behavior with a PyTorch autoencoder and presenting the results in a Streamlit
 SOC-style dashboard.
