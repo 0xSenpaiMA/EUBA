@@ -52,7 +52,7 @@ if args.reset:
 db.execute("""CREATE TABLE IF NOT EXISTS scores (
     received_at REAL, user_id INTEGER, date TEXT, scenario TEXT,
     is_attack INTEGER, error REAL, risk REAL, alert INTEGER,
-    top_features TEXT)""")
+    top_features TEXT, features TEXT)""")
 db.commit()
 
 # --- Kafka ---------------------------------------------------------------
@@ -87,10 +87,13 @@ def process(event):
     alert = error > threshold
     top = pd.Series(per_feature, index=cols).nlargest(3).index.tolist()
 
-    db.execute("INSERT INTO scores VALUES (?,?,?,?,?,?,?,?,?)", (
+    # « features » = l'événement complet : le tableau de bord s'en sert pour
+    # afficher tous les flags d'un utilisateur quand on clique dessus.
+    db.execute("INSERT INTO scores VALUES (?,?,?,?,?,?,?,?,?,?)", (
         time.time(), int(event["user_id"]), event["date"],
         event.get("scenario", "Inconnu"), int(event.get("is_attack", 0)),
-        error, risk, int(alert), json.dumps(top)))
+        error, risk, int(alert), json.dumps(top),
+        json.dumps({c: event[c] for c in cols})))
 
     if alert:
         alerts_out.send(TOPIC_ALERTS, {

@@ -2,7 +2,7 @@
 
 > **Version 2 (branche `v2-kafka-streaming`)** : modèle réentraîné avec
 > découpage temporel, seuil dynamique μ + kσ, attaques simulées et évaluation,
-> tableau de bord à 5 onglets et détection en temps réel via **Kafka**.
+> tableau de bord (Flux Kafka avec détail utilisateur cliquable, Évaluation) et détection en temps réel via **Kafka**.
 > **Lancement en une commande :** voir [LANCEMENT.md](LANCEMENT.md)
 > (`powershell -ExecutionPolicy Bypass -File run.ps1 -Kafka`).
 

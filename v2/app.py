@@ -1,17 +1,21 @@
 """
 EUBA v2 - Tableau de bord SOC (Streamlit).
 
-Lancement :  streamlit run v2/app.py
+  📡 Flux Kafka : détection en temps réel ; cliquer sur un utilisateur du
+                  tableau des alertes affiche son détail et ses flags.
+  ✅ Évaluation : performances du modèle sur le jeu de test avec attaques.
+
+Lancement :  streamlit run v2/app.py   (ou run.ps1 à la racine du dépôt)
 """
 import json
 import sqlite3
 import time
+from functools import partial
 
 import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 import torch
 
@@ -19,15 +23,14 @@ from euba_model import (ARTIFACTS_DIR, TEST_DATA, V2_DIR, EUBAAutoencoder,
                         dynamic_threshold, feature_errors, risk_score,
                         reconstruction_errors)
 
-COLORS = {"Normal": "#2a9d8f", "Usurpation": "#e63946",
-          "Exfiltration": "#f4a261"}
+STREAM_DB = V2_DIR / "stream.db"
 
 st.set_page_config(page_title="EUBA v2 | SOC", page_icon="🛡️",
                    layout="wide")
 
 
 # ==================================================
-# CHARGEMENT
+# CHARGEMENT DU MODÈLE
 # ==================================================
 @st.cache_resource
 def load_model():
@@ -40,252 +43,130 @@ def load_model():
     return model, scaler, meta
 
 
-@st.cache_data
-def score_dataset(df):
-    """Calcule l'erreur de reconstruction de chaque ligne (une seule fois)."""
-    model, scaler, meta = load_model()
-    x = scaler.transform(df[meta["feature_cols"]])
-    out = df[["user_id", "date"]].copy()
-    out["scenario"] = df.get("scenario", "Inconnu")
-    out["is_attack"] = df.get("is_attack", 0)
-    out["error"] = reconstruction_errors(model, x)
-    return out, feature_errors(model, x)
-
-
 try:
     model, scaler, meta = load_model()
 except FileNotFoundError:
     st.error("Modèle introuvable. Lancez d'abord : python v2/train.py")
     st.stop()
 
-# ==================================================
-# BARRE LATÉRALE : SEUIL DYNAMIQUE
-# ==================================================
-st.sidebar.header("⚙️ Seuil de détection")
-k = st.sidebar.slider("k (nombre d'écarts-types)", 1.0, 6.0,
-                      float(meta["default_k"]), 0.5)
-val_errors = meta["val_errors"]
-threshold = dynamic_threshold(val_errors, k)
-st.sidebar.latex(r"seuil = \mu + k\,\sigma")
-st.sidebar.write(f"μ = {val_errors.mean():.5f}")
-st.sidebar.write(f"σ = {val_errors.std():.5f}")
-st.sidebar.metric("Seuil actuel", f"{threshold:.5f}")
-st.sidebar.caption("μ et σ sont calculés sur les erreurs du trafic "
-                   "légitime de validation. Score de risque = 50 au seuil.")
-
-uploaded = st.sidebar.file_uploader("Autre jeu de test (CSV)", type="csv")
-
-if uploaded is not None:
-    raw = pd.read_csv(uploaded)
-elif TEST_DATA.exists():
-    raw = pd.read_csv(TEST_DATA)
-else:
-    st.error("Jeu de test introuvable. Lancez : python v2/simulate_attacks.py")
-    st.stop()
-
-missing = [c for c in meta["feature_cols"] if c not in raw.columns]
-if missing:
-    st.error(f"Colonnes manquantes dans le CSV : {', '.join(missing[:8])}")
-    st.stop()
-
-results, feat_err = score_dataset(raw)
-results["risk"] = risk_score(results["error"], threshold)
-results["alert"] = results["error"] > threshold
-has_truth = results["is_attack"].sum() > 0
+cols = meta["feature_cols"]
+k = float(meta["default_k"])
+threshold = dynamic_threshold(meta["val_errors"], k)
 
 # ==================================================
 # EN-TÊTE
 # ==================================================
 st.title("🛡️ EUBA v2 · Détection d'anomalies comportementales")
-st.caption("Autoencodeur entraîné uniquement sur le trafic légitime · "
-           "erreur de reconstruction ‖x − x̂‖² · seuil dynamique μ + kσ")
+st.caption(f"Autoencodeur entraîné uniquement sur le trafic légitime · "
+           f"seuil = μ + {k:g}σ = {threshold:.5f} (score de risque 50) · "
+           "une alerte est un signal à investiguer, pas une preuve.")
 
-tab_live, tab_loss, tab_eval, tab_user, tab_kafka = st.tabs(
-    ["🛰️ SOC en direct", "📉 Analyse de la perte",
-     "✅ Évaluation", "🔎 Détail utilisateur", "📡 Flux Kafka"])
-
-
-# ==================================================
-# 1. SOC EN DIRECT
-# ==================================================
-def render_day(day, container):
-    today = results[results["date"] == day].sort_values("risk",
-                                                         ascending=False)
-    alerts = today[today["alert"]]
-    with container.container():
-        st.subheader(f"📅 Journée du {day}")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Utilisateurs surveillés", len(today))
-        c2.metric("🔴 Comptes en alerte", len(alerts))
-        c3.metric("Score de risque max", int(today["risk"].max()))
-
-        if len(alerts):
-            st.error("🚨 Comptes suspects : " + ", ".join(
-                f"**{u}** ({int(r)})"
-                for u, r in zip(alerts["user_id"], alerts["risk"])))
-        else:
-            st.success("✅ Aucun comportement anormal ce jour.")
-
-        table = pd.DataFrame({
-            "Utilisateur": today["user_id"].astype(str),
-            "Score de risque": today["risk"].astype(int),
-            "Statut": np.where(today["alert"], "🔴 ALERTE", "🟢 Normal"),
-        })
-        if has_truth:
-            table["Simulation (vérité)"] = today["scenario"].values
-
-        def red_rows(row):
-            style = ("background-color: #ffccd0; color: #7a0010; "
-                     "font-weight: 600") if row["Statut"] == "🔴 ALERTE" \
-                else ""
-            return [style] * len(row)
-
-        st.dataframe(
-            table.head(25).style.apply(red_rows, axis=1),
-            hide_index=True, use_container_width=True,
-            column_config={"Score de risque": st.column_config.ProgressColumn(
-                min_value=0, max_value=100, format="%d")},
-        )
-        st.caption("Top 25 des utilisateurs du jour, triés par score de "
-                   "risque. Une alerte est un signal à investiguer, pas "
-                   "une preuve d'attaque.")
-
-
-with tab_live:
-    days = sorted(results["date"].unique())
-    col_a, col_b = st.columns([3, 1])
-    day = col_a.select_slider("Journée", options=days, value=days[0])
-    speed = col_b.selectbox("Vitesse", [1.5, 1.0, 0.5], index=0,
-                            format_func=lambda s: f"{s} s / jour")
-    play = st.button("▶️ Simuler jour par jour", type="primary")
-    placeholder = st.empty()
-    if play:
-        for d in days:
-            render_day(d, placeholder)
-            time.sleep(speed)
-    else:
-        render_day(day, placeholder)
+tab_kafka, tab_eval = st.tabs(["📡 Flux Kafka", "✅ Évaluation"])
 
 
 # ==================================================
-# 2. ANALYSE DE LA PERTE
+# 1. FLUX KAFKA + DÉTAIL UTILISATEUR
 # ==================================================
-with tab_loss:
-    st.subheader("Distribution de l'erreur de reconstruction")
-    fig = px.histogram(
-        results, x="error", color="scenario", nbins=120,
-        barmode="overlay", opacity=0.75, log_y=True,
-        color_discrete_map=COLORS,
-        labels={"error": "Erreur de reconstruction ‖x − x̂‖²",
-                "scenario": "Comportement"})
-    fig.add_vline(x=threshold, line_dash="dash", line_color="black",
-                  annotation_text=f"Seuil (k={k})")
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption("Échelle logarithmique sur l'axe vertical pour voir les "
-               "petits groupes. Bougez k dans la barre latérale : la "
-               "ligne du seuil se déplace.")
-
-    st.subheader("Courbe d'apprentissage")
-    hist = meta["history"]
-    fig_loss = go.Figure()
-    fig_loss.add_scatter(y=hist["train_loss"], name="Entraînement")
-    fig_loss.add_scatter(y=hist["val_loss"], name="Validation")
-    fig_loss.update_layout(xaxis_title="Époque", yaxis_title="Perte MSE")
-    st.plotly_chart(fig_loss, use_container_width=True)
+def read_stream():
+    """Lit les scores écrits par le détecteur Kafka."""
+    if not STREAM_DB.exists():
+        return None
+    try:
+        with sqlite3.connect(STREAM_DB) as con:
+            return pd.read_sql("SELECT * FROM scores", con)
+    except (sqlite3.Error, pd.errors.DatabaseError):
+        return pd.DataFrame()
 
 
-# ==================================================
-# 3. ÉVALUATION
-# ==================================================
-with tab_eval:
-    if not has_truth:
-        st.info("Ce jeu de données ne contient pas d'attaques simulées : "
-                "pas d'évaluation possible.")
-    else:
-        attack = results["is_attack"] == 1
-        tp = int((results["alert"] & attack).sum())
-        fn = int((~results["alert"] & attack).sum())
-        fp = int((results["alert"] & ~attack).sum())
-        tn = int((~results["alert"] & ~attack).sum())
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Attaques détectées (rappel)",
-                  f"{100 * tp / (tp + fn):.1f} %", f"{tp}/{tp + fn}")
-        c2.metric("Fausses alertes (FPR)",
-                  f"{100 * fp / (fp + tn):.2f} %", f"{fp}/{fp + tn}",
-                  delta_color="inverse")
-        c3.metric("Précision", f"{100 * tp / max(tp + fp, 1):.1f} %")
-
-        per_scenario = (results[attack].groupby("scenario")["alert"]
-                        .agg(["sum", "count"]))
-        per_scenario["Détection"] = (100 * per_scenario["sum"]
-                                     / per_scenario["count"]).round(1)
-        st.dataframe(per_scenario.rename(columns={
-            "sum": "Détectées", "count": "Total"}),
-            use_container_width=True)
-
-        st.subheader("Matrice de confusion")
-        cm = pd.DataFrame([[tn, fp], [fn, tp]],
-                          index=["Réel : normal", "Réel : attaque"],
-                          columns=["Prédit : normal", "Prédit : alerte"])
-        st.plotly_chart(px.imshow(cm, text_auto=True,
-                                  color_continuous_scale="Blues"),
-                        use_container_width=True)
+def remember_click(table_key, users):
+    """Mémorise l'utilisateur cliqué (il reste affiché même si le tableau
+    se met à jour avec de nouvelles alertes)."""
+    selection = st.session_state[table_key].selection
+    # Clic sur la case de la ligne (rows) OU sur n'importe quelle cellule
+    rows = selection.get("rows", []) or [c[0] for c in
+                                          selection.get("cells", [])]
+    if rows:
+        st.session_state["picked_user"] = users[rows[0]]
 
 
-# ==================================================
-# 4. DÉTAIL UTILISATEUR
-# ==================================================
-with tab_user:
-    ranking = (results.groupby("user_id")["risk"].max()
-               .sort_values(ascending=False))
-    user = st.selectbox(
-        "Utilisateur (triés du plus risqué au moins risqué)",
-        ranking.index,
-        format_func=lambda u: f"{u}  ·  risque max {int(ranking[u])}")
+def user_detail(live, user):
+    """Historique de risque + flags responsables, pour un utilisateur."""
+    hist = live[live["user_id"] == user].sort_values("date")
+    worst = hist.loc[hist["error"].idxmax()]
 
-    hist_u = results[results["user_id"] == user].sort_values("date")
-    fig_u = px.line(hist_u, x="date", y="risk", markers=True,
-                    labels={"risk": "Score de risque", "date": "Date"})
-    fig_u.add_hline(y=50, line_dash="dash", line_color="red",
-                    annotation_text="Seuil d'alerte")
-    fig_u.update_yaxes(range=[0, 105])
-    st.plotly_chart(fig_u, use_container_width=True)
+    st.divider()
+    head, close = st.columns([6, 1])
+    head.subheader(f"🔎 Utilisateur {user}")
+    if close.button("✖ Fermer", key="close_detail"):
+        st.session_state.pop("picked_user", None)
+        st.rerun(scope="fragment")
 
-    worst = hist_u["error"].idxmax()
-    st.markdown(f"**Pourquoi ?** Variables les moins bien reconstruites "
-                f"le {results.loc[worst, 'date']} :")
-    contrib = pd.Series(feat_err[worst], index=meta["feature_cols"])
-    top = contrib.sort_values(ascending=False).head(8)
-    st.plotly_chart(px.bar(top[::-1], orientation="h",
-                           labels={"value": "(x − x̂)²", "index": ""}),
-                    use_container_width=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Risque max", int(hist["risk"].max()))
+    c2.metric("Journées en alerte", int(hist["alert"].sum()))
+    c3.metric("Journées reçues", len(hist))
+    c4.metric("Simulation (vérité)", worst["scenario"])
 
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Score de risque jour par jour**")
+        fig = px.line(hist, x="date", y="risk", markers=True,
+                      labels={"risk": "Score de risque", "date": "Journée"})
+        fig.add_hline(y=50, line_dash="dash", line_color="red",
+                      annotation_text="Seuil d'alerte")
+        fig.update_xaxes(type="category")
+        fig.update_yaxes(range=[0, 105])
+        fig.update_layout(height=320, margin=dict(t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
 
-# ==================================================
-# 5. FLUX KAFKA (STREAMING TEMPS RÉEL)
-# ==================================================
-STREAM_DB = V2_DIR / "stream.db"
+    if "features" not in hist.columns or hist["features"].isna().all():
+        right.info("Détail des flags indisponible : relancez le détecteur "
+                   "avec --reset pour enregistrer les événements complets.")
+        return
+
+    # Le modèle reconstruit l'événement : on compare observé / attendu
+    event = pd.DataFrame([json.loads(worst["features"])])[cols]
+    x = scaler.transform(event)
+    with torch.no_grad():
+        x_hat = model(torch.tensor(x, dtype=torch.float32)).numpy()
+    expected = scaler.inverse_transform(x_hat)[0]
+    errs = feature_errors(model, x)[0]
+    flags = (pd.DataFrame({
+        "Variable": cols,
+        "Observé": event.iloc[0].to_numpy(),
+        "Attendu par le modèle": expected.round(2),
+        "Erreur": errs,
+    }).sort_values("Erreur", ascending=False).head(8))
+
+    with right:
+        st.markdown(f"**Pourquoi ? Flags les plus anormaux le "
+                    f"{worst['date']}** (risque {int(worst['risk'])})")
+        bar = px.bar(flags[::-1], x="Erreur", y="Variable", orientation="h",
+                     labels={"Erreur": "(x − x̂)²", "Variable": ""},
+                     color_discrete_sequence=["#e63946"])
+        bar.update_layout(height=320, margin=dict(t=10, b=10))
+        st.plotly_chart(bar, use_container_width=True)
+
+    st.dataframe(flags, hide_index=True, use_container_width=True,
+                 column_config={"Erreur": st.column_config.ProgressColumn(
+                     min_value=0, max_value=1, format="%.3f")})
+    st.caption("« Observé » = valeur reçue dans le flux ; « Attendu » = ce "
+               "que le modèle prévoit pour un comportement normal. Un flag "
+               "observé à 1 là où le modèle attend environ 0 est inhabituel.")
 
 
 @st.fragment(run_every=2)          # seule cette partie se rafraîchit
 def kafka_live():
-    if not STREAM_DB.exists():
-        st.info("Aucun flux reçu pour l'instant. Lancez dans 3 terminaux :")
-        st.code("docker compose -f v2/docker-compose.yml up -d\n"
-                "python v2/kafka_detector.py --reset\n"
-                "python v2/kafka_producer.py", language="bash")
+    live = read_stream()
+    if live is None:
+        st.info("Aucun flux reçu pour l'instant. Lancez :")
+        st.code("powershell -ExecutionPolicy Bypass -File run.ps1 -Kafka",
+                language="bash")
         return
-    try:
-        with sqlite3.connect(STREAM_DB) as con:
-            live = pd.read_sql("SELECT * FROM scores", con)
-    except (sqlite3.Error, pd.errors.DatabaseError):
-        live = pd.DataFrame()
     if live.empty:
         st.info("Détecteur prêt, en attente des messages Kafka...")
         return
 
-    # Le seuil suit le curseur k de la barre latérale
     live["risk"] = risk_score(live["error"], threshold)
     live["alert"] = live["error"] > threshold
     alerts = live[live["alert"]]
@@ -298,10 +179,9 @@ def kafka_live():
     c4.metric("Dernier message", "en direct" if lag < 5
               else f"il y a {int(lag)} s")
     if lag > 15:
-        st.warning("⏸️ Plus aucun message depuis "
-                   f"{int(lag)} s : le flux est terminé ou arrêté. Si ce n'est "
-                   "pas la fin, vérifiez que Kafka (Docker) et le producteur "
-                   "tournent toujours.")
+        st.warning(f"⏸️ Plus aucun message depuis {int(lag)} s : le flux est "
+                   "terminé ou arrêté. Si ce n'est pas la fin, vérifiez que "
+                   "Kafka (Docker) et le producteur tournent toujours.")
 
     per_day = (live.groupby("date")
                .agg(messages=("user_id", "size"), alertes=("alert", "sum"))
@@ -311,32 +191,102 @@ def kafka_live():
                  labels={"date": "Journée", "alertes": "Alertes",
                          "messages": "Messages"},
                  color_discrete_sequence=["#e63946"])
-    fig.update_xaxes(type="category")      # une barre par journée reçue
+    fig.update_xaxes(type="category")
     fig.update_yaxes(rangemode="tozero", dtick=1)
-    fig.update_layout(height=260, margin=dict(t=10, b=10))
+    fig.update_layout(height=240, margin=dict(t=10, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("**Dernières alertes** (les plus récentes en haut)")
+    st.markdown("**Utilisateurs en alerte** — 👆 cliquez sur une ligne "
+                "pour voir le détail et les flags")
     if alerts.empty:
         st.success("✅ Aucune alerte pour l'instant. (Dans le jeu de test, "
                    "les attaques simulées commencent le 2024-12-21.)")
     else:
-        show = alerts.sort_values("received_at", ascending=False).head(15)
-        st.dataframe(pd.DataFrame({
-            "Journée": show["date"],
-            "Utilisateur": show["user_id"].astype(str),
-            "Score de risque": show["risk"].astype(int),
-            "Causes principales": show["top_features"].map(
+        # Une ligne par utilisateur, la dernière alerte en haut
+        last = alerts.sort_values("received_at").groupby("user_id").tail(1)
+        per_user = (alerts.groupby("user_id")
+                    .agg(n=("alert", "size"), risk=("risk", "max"),
+                         at=("received_at", "max"))
+                    .join(last.set_index("user_id")[
+                        ["date", "top_features", "scenario"]])
+                    .sort_values("at", ascending=False).reset_index())
+        users = per_user["user_id"].tolist()
+        table = pd.DataFrame({
+            "Utilisateur": per_user["user_id"].astype(str),
+            "Alertes": per_user["n"],
+            "Risque max": per_user["risk"].astype(int),
+            "Dernière alerte": per_user["date"],
+            "Causes principales": per_user["top_features"].map(
                 lambda s: ", ".join(json.loads(s))),
-            "Simulation (vérité)": show["scenario"],
-        }), hide_index=True, use_container_width=True,
-            column_config={"Score de risque": st.column_config.ProgressColumn(
+            "Simulation (vérité)": per_user["scenario"],
+        })
+        # La clé change quand une alerte arrive : la sélection est remise à
+        # zéro au lieu de surligner une mauvaise ligne (les lignes bougent).
+        key = f"alerts_{len(alerts)}"
+        st.dataframe(
+            table, key=key, hide_index=True, use_container_width=True,
+            on_select=partial(remember_click, key, users),
+            selection_mode=["single-row", "single-cell"],
+            column_config={"Risque max": st.column_config.ProgressColumn(
                 min_value=0, max_value=100, format="%d")})
+
+    picked = st.session_state.get("picked_user")
+    if picked is not None and picked in set(live["user_id"]):
+        user_detail(live, picked)
 
 
 with tab_kafka:
     st.subheader("📡 Détection en temps réel via Kafka")
-    st.caption("Producteur → topic « euba-events » → détecteur (autoencodeur) "
-               "→ alertes (topic « euba-alerts ») → ce tableau, rafraîchi "
-               "toutes les 2 secondes.")
+    st.caption("Producteur → topic « euba-events » → détecteur "
+               "(autoencodeur) → alertes (topic « euba-alerts ») → ce "
+               "tableau, rafraîchi toutes les 2 secondes.")
     kafka_live()
+
+
+# ==================================================
+# 2. ÉVALUATION (jeu de test complet avec attaques simulées)
+# ==================================================
+@st.cache_data
+def score_test_set():
+    df = pd.read_csv(TEST_DATA)
+    out = df[["user_id", "date", "scenario", "is_attack"]].copy()
+    out["error"] = reconstruction_errors(model, scaler.transform(df[cols]))
+    return out
+
+
+with tab_eval:
+    if not TEST_DATA.exists():
+        st.info("Jeu de test introuvable. Lancez : "
+                "python v2/simulate_attacks.py")
+    else:
+        results = score_test_set()
+        alert = results["error"] > threshold
+        attack = results["is_attack"] == 1
+        tp = int((alert & attack).sum())
+        fn = int((~alert & attack).sum())
+        fp = int((alert & ~attack).sum())
+        tn = int((~alert & ~attack).sum())
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Attaques détectées (rappel)",
+                  f"{100 * tp / max(tp + fn, 1):.1f} %", f"{tp}/{tp + fn}")
+        c2.metric("Fausses alertes (FPR)",
+                  f"{100 * fp / max(fp + tn, 1):.2f} %", f"{fp}/{fp + tn}",
+                  delta_color="inverse")
+        c3.metric("Précision", f"{100 * tp / max(tp + fp, 1):.1f} %")
+
+        per_scenario = (pd.DataFrame({"scenario": results["scenario"],
+                                      "alert": alert})[attack]
+                        .groupby("scenario")["alert"].agg(["sum", "count"]))
+        per_scenario["Détection (%)"] = (100 * per_scenario["sum"]
+                                         / per_scenario["count"]).round(1)
+        st.dataframe(per_scenario.rename(columns={
+            "sum": "Détectées", "count": "Total"}), use_container_width=True)
+
+        st.subheader("Matrice de confusion")
+        cm = pd.DataFrame([[tn, fp], [fn, tp]],
+                          index=["Réel : normal", "Réel : attaque"],
+                          columns=["Prédit : normal", "Prédit : alerte"])
+        st.plotly_chart(px.imshow(cm, text_auto=True,
+                                  color_continuous_scale="Blues"),
+                        use_container_width=True)

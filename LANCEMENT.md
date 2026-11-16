@@ -71,7 +71,7 @@ python v2/kafka_producer.py --delay 0.02
 | `v2/euba_model.py` | code partagé : modèle, chargement des données, erreur, seuil, score |
 | `v2/train.py` | prétraitement + entraînement de l'autoencodeur |
 | `v2/simulate_attacks.py` | injection d'attaques simulées + évaluation |
-| `v2/app.py` | tableau de bord Streamlit (5 onglets) |
+| `v2/app.py` | tableau de bord Streamlit : « Flux Kafka » (alertes en direct, clic sur un utilisateur = détail et flags) et « Évaluation » |
 | `v2/kafka_producer.py` | envoie les événements sur le topic `euba-events` |
 | `v2/kafka_detector.py` | consomme le flux, calcule les scores, publie sur `euba-alerts` |
 | `v2/docker-compose.yml` | Kafka 3.8 (un nœud, mode KRaft) |
