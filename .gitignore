@@ -6,3 +6,7 @@ __pycache__/
 .streamlit/
 .DS_Store
 
+
+# EUBA v2 : fichiers générés localement
+v2/stream.db*
+v2/euba_v2_test_with_attacks.csv
